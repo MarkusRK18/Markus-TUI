@@ -1,10 +1,40 @@
 use super::App;
 use crate::providers::models::ProviderKind;
+use crate::providers::ReleaseProvider;
 use crate::tui::{action::Action, overlay::NotificationKind, state::Screen};
 
 impl App {
     pub(super) fn resolve_download_base_dir(&self) -> std::path::PathBuf {
         crate::service::resolve_download_dir(self.state.download_dir.as_deref())
+    }
+
+    pub(super) fn find_subject_info(
+        &self,
+        subject_id: &str,
+    ) -> Option<(String, ProviderKind, bool)> {
+        if let Some(res) = self.state.search_results.iter().find(|r| r.id == subject_id) {
+            return Some((res.title.clone(), res.provider, res.stype == 2));
+        }
+        if let Some(fav) = self
+            .state
+            .favorites
+            .items
+            .iter()
+            .find(|f| f.subject_id == subject_id)
+        {
+            let provider =
+                ProviderKind::parse(&fav.provider).unwrap_or(self.state.active_provider);
+            return Some((fav.title.clone(), provider, fav.stype == 2));
+        }
+        if let Some(det) = self.state.preview_cache.peek(subject_id) {
+            return Some((det.title.clone(), det.id.provider, det.is_series()));
+        }
+        if let Some(det) = &self.state.selected_details {
+            if det.id.value == subject_id {
+                return Some((det.title.clone(), det.id.provider, det.is_series()));
+            }
+        }
+        None
     }
 
     pub(super) fn start_resilient_download(
@@ -13,7 +43,7 @@ impl App {
         link: Option<String>,
         headers: Vec<(String, String)>,
     ) {
-        if self.state.download_progress.is_some() || self.state.active_screen != Screen::Details {
+        if self.state.active_screen != Screen::Details {
             return;
         }
         let Some(link) = link else {
@@ -95,19 +125,100 @@ impl App {
             .or_else(|| self.state.season_subtitle_preference.clone().flatten());
 
         self.state.is_waiting_for_download_stream = false;
-        self.state.download_title = Some(base_name.clone());
-        self.state.download_status = Some("Preparing download...".into());
-        self.state.download_progress = Some(0.0);
-        self.state
-            .cancel_download
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let job_id = self.state.next_download_id;
+        self.state.next_download_id += 1;
+
+        if self.state.active_downloads.len() >= self.state.max_concurrent_downloads {
+            self.state
+                .pending_downloads
+                .push_back(crate::tui::state::QueuedDownloadJob::Resolved {
+                    id: job_id,
+                    title: base_name.clone(),
+                    target_dir,
+                    base_name: base_name.clone(),
+                    destination,
+                    link,
+                    headers,
+                    subtitle_url,
+                    sub_lang,
+                    is_series,
+                    season,
+                    episode,
+                });
+            self.state.notify(
+                NotificationKind::Info,
+                "Download Queued",
+                format!(
+                    "{base_name} queued (limit {} reached, position {}).",
+                    self.state.max_concurrent_downloads,
+                    self.state.pending_downloads.len()
+                ),
+            );
+            return;
+        }
+
         self.state.notify(
             NotificationKind::Info,
             "Download Started",
             format!("Downloading {base_name}.{extension} (resumable)."),
         );
 
-        let cancel = self.state.cancel_download.clone();
+        self.spawn_download_worker(
+            job_id,
+            base_name.clone(),
+            target_dir,
+            base_name,
+            destination,
+            link,
+            headers,
+            subtitle_url,
+            sub_lang,
+            is_series,
+            season,
+            episode,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_download_worker(
+        &mut self,
+        job_id: u64,
+        title: String,
+        target_dir: std::path::PathBuf,
+        _base_name: String,
+        destination: std::path::PathBuf,
+        link: String,
+        headers: Vec<(String, String)>,
+        subtitle_url: Option<String>,
+        sub_lang: Option<String>,
+        is_series: bool,
+        season: usize,
+        episode: usize,
+    ) {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(existing) = self.state.active_downloads.iter_mut().find(|d| d.id == job_id) {
+            existing.cancel = cancel.clone();
+            existing.destination = destination.clone();
+            existing.status = "Preparing download...".into();
+        } else {
+            self.state
+                .active_downloads
+                .push(crate::tui::state::ActiveDownload {
+                    id: job_id,
+                    title: title.clone(),
+                    destination: destination.clone(),
+                    progress: 0.0,
+                    status: "Preparing download...".into(),
+                    cancel: cancel.clone(),
+                    is_series,
+                    season,
+                    episode,
+                });
+        }
+        self.state.sync_legacy_download_state();
+
+        let cancel_flag = cancel.clone();
         let sender = self.action_sender.clone();
         let user_agent = self.service.client.user_agent().to_string();
 
@@ -143,13 +254,14 @@ impl App {
 
         let is_dash = link.ends_with(".mpd") || link.contains("/dash/");
 
-        self.request_tasks.cancel_download();
+        let dest_clone = destination.clone();
         let handle = tokio::spawn(async move {
             if let Err(error) = tokio::fs::create_dir_all(&target_dir).await {
                 sender
-                    .send(Action::DownloadFailed(format!(
-                        "Cannot create download directory: {error}"
-                    )))
+                    .send(Action::DownloadTaskFailed {
+                        id: job_id,
+                        error: format!("Cannot create download directory: {error}"),
+                    })
                     .ok();
                 return;
             }
@@ -175,7 +287,7 @@ impl App {
                     subtitle_extension
                 };
 
-                let subtitle_path = destination.with_extension(final_ext);
+                let subtitle_path = dest_clone.with_extension(final_ext);
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     client.get(subtitle_url).send(),
@@ -229,7 +341,10 @@ impl App {
             if is_dash {
                 let Some(ytdlp_bin) = crate::player::find_in_path("yt-dlp") else {
                     sender
-                        .send(Action::DownloadFailed(yt_dlp_missing_guidance()))
+                        .send(Action::DownloadTaskFailed {
+                            id: job_id,
+                            error: yt_dlp_missing_guidance(),
+                        })
                         .ok();
                     return;
                 };
@@ -247,7 +362,7 @@ impl App {
                     .arg("--newline")
                     .arg("--part")
                     .arg("-o")
-                    .arg(&destination)
+                    .arg(&dest_clone)
                     .arg("--force-overwrites")
                     .arg(&link);
                 #[cfg(target_os = "windows")]
@@ -262,9 +377,10 @@ impl App {
                     Ok(child) => child,
                     Err(err) => {
                         sender
-                            .send(Action::DownloadFailed(format!(
-                                "Failed to start yt-dlp: {err}"
-                            )))
+                            .send(Action::DownloadTaskFailed {
+                                id: job_id,
+                                error: format!("Failed to start yt-dlp: {err}"),
+                            })
                             .ok();
                         return;
                     }
@@ -289,23 +405,25 @@ impl App {
                         std::time::Instant::now() - std::time::Duration::from_secs(1);
 
                     loop {
-                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                             let _ = child.kill().await;
                             sender
-                                .send(Action::DownloadPaused(
-                                    destination.to_string_lossy().into_owned(),
-                                ))
+                                .send(Action::DownloadTaskPaused {
+                                    id: job_id,
+                                    path: dest_clone.to_string_lossy().into_owned(),
+                                })
                                 .ok();
                             return;
                         }
                         tokio::select! {
                             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                                     let _ = child.kill().await;
                                     sender
-                                        .send(Action::DownloadPaused(
-                                            destination.to_string_lossy().into_owned(),
-                                        ))
+                                        .send(Action::DownloadTaskPaused {
+                                            id: job_id,
+                                            path: dest_clone.to_string_lossy().into_owned(),
+                                        })
                                         .ok();
                                     return;
                                 }
@@ -325,12 +443,29 @@ impl App {
                                             max_progress = max_progress.max(normalized_pct);
                                             if last_send.elapsed() >= std::time::Duration::from_millis(250) || raw_pct >= 99.9 {
                                                 sender
-                                                    .send(Action::UpdateDownload(Some(max_progress), Some(display_status)))
+                                                    .send(Action::UpdateDownloadProgress {
+                                                        id: job_id,
+                                                        progress: Some(max_progress),
+                                                        status: Some(display_status.clone()),
+                                                    })
+                                                    .ok();
+                                                sender
+                                                    .send(Action::UpdateDownload(
+                                                        Some(max_progress),
+                                                        Some(display_status),
+                                                    ))
                                                     .ok();
                                                 last_send = std::time::Instant::now();
                                             }
                                         } else if line.contains("[Merger]") || line.contains("[ffmpeg]") {
                                             max_progress = max_progress.max(99.0);
+                                            sender
+                                                .send(Action::UpdateDownloadProgress {
+                                                    id: job_id,
+                                                    progress: Some(max_progress),
+                                                    status: Some("Merging audio & video...".to_string()),
+                                                })
+                                                .ok();
                                             sender
                                                 .send(Action::UpdateDownload(
                                                     Some(max_progress),
@@ -352,31 +487,35 @@ impl App {
                 match status {
                     Ok(s) if s.success() => {
                         sender
-                            .send(Action::DownloadCompleted(
-                                destination.to_string_lossy().into_owned(),
-                            ))
+                            .send(Action::DownloadTaskCompleted {
+                                id: job_id,
+                                path: dest_clone.to_string_lossy().into_owned(),
+                            })
                             .ok();
                     }
                     Ok(s) => {
-                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                             sender
-                                .send(Action::DownloadPaused(
-                                    destination.to_string_lossy().into_owned(),
-                                ))
+                                .send(Action::DownloadTaskPaused {
+                                    id: job_id,
+                                    path: dest_clone.to_string_lossy().into_owned(),
+                                })
                                 .ok();
                         } else {
                             sender
-                                .send(Action::DownloadFailed(format!(
-                                    "yt-dlp exited with status {s}"
-                                )))
+                                .send(Action::DownloadTaskFailed {
+                                    id: job_id,
+                                    error: format!("yt-dlp exited with status {s}"),
+                                })
                                 .ok();
                         }
                     }
                     Err(err) => {
                         sender
-                            .send(Action::DownloadFailed(format!(
-                                "Failed to wait for yt-dlp: {err}"
-                            )))
+                            .send(Action::DownloadTaskFailed {
+                                id: job_id,
+                                error: format!("Failed to wait for yt-dlp: {err}"),
+                            })
                             .ok();
                     }
                 }
@@ -386,8 +525,8 @@ impl App {
                 let result = crate::download::download(
                     &client,
                     &link,
-                    &destination,
-                    cancel,
+                    &dest_clone,
+                    cancel_flag,
                     move |progress| {
                         if last_progress_send.elapsed() < std::time::Duration::from_millis(100)
                             && progress.downloaded < progress.total.unwrap_or_default()
@@ -428,6 +567,13 @@ impl App {
                             )
                         };
                         progress_sender
+                            .send(Action::UpdateDownloadProgress {
+                                id: job_id,
+                                progress: Some(percentage),
+                                status: Some(status.clone()),
+                            })
+                            .ok();
+                        progress_sender
                             .send(Action::UpdateDownload(Some(percentage), Some(status)))
                             .ok();
                     },
@@ -437,20 +583,27 @@ impl App {
                 match result {
                     Ok(crate::download::DownloadOutcome::Completed { .. }) => {
                         sender
-                            .send(Action::DownloadCompleted(
-                                destination.to_string_lossy().into_owned(),
-                            ))
+                            .send(Action::DownloadTaskCompleted {
+                                id: job_id,
+                                path: dest_clone.to_string_lossy().into_owned(),
+                            })
                             .ok();
                     }
                     Ok(crate::download::DownloadOutcome::Paused { .. }) => {
                         sender
-                            .send(Action::DownloadPaused(
-                                destination.to_string_lossy().into_owned(),
-                            ))
+                            .send(Action::DownloadTaskPaused {
+                                id: job_id,
+                                path: dest_clone.to_string_lossy().into_owned(),
+                            })
                             .ok();
                     }
                     Err(error) => {
-                        sender.send(Action::DownloadFailed(error.to_string())).ok();
+                        sender
+                            .send(Action::DownloadTaskFailed {
+                                id: job_id,
+                                error: error.to_string(),
+                            })
+                            .ok();
                     }
                 }
             }
@@ -461,12 +614,13 @@ impl App {
                 && e.is_panic()
             {
                 log::error!("download task panicked: {e}");
-                let _ = fail_sender.send(Action::DownloadFailed(
-                    "Download task failed unexpectedly".to_string(),
-                ));
+                let _ = fail_sender.send(Action::DownloadTaskFailed {
+                    id: job_id,
+                    error: "Download task failed unexpectedly".to_string(),
+                });
             }
         });
-        self.request_tasks.download = Some(watcher);
+        self.request_tasks.download_tasks.insert(job_id, watcher);
     }
 }
 
@@ -735,16 +889,398 @@ impl App {
                 }
             }
 
+            Action::PromptBatchDownload => {
+                if self.state.marked_count() > 0 {
+                    self.state.show_batch_download_confirm = true;
+                    self.state.batch_download_confirm_yes_selected = true;
+                } else {
+                    self.state.notify(
+                        NotificationKind::Info,
+                        "Batch Download",
+                        "No movies marked. Press 'm' to mark items for download.",
+                    );
+                }
+            }
+
+            Action::ConfirmBatchDownload => {
+                self.state.show_batch_download_confirm = false;
+                let marked_ids: Vec<String> =
+                    self.state.marked_search_results.iter().cloned().collect();
+                self.state.clear_marked_search_results();
+                if marked_ids.is_empty() {
+                    return None;
+                }
+                let mut queued_count = 0;
+                for subject_id in marked_ids {
+                    if let Some((title, provider, is_series)) = self.find_subject_info(&subject_id)
+                    {
+                        if is_series {
+                            self.state.notify(
+                                NotificationKind::Warning,
+                                "Skipping Series",
+                                format!(
+                                    "{title} is a series. Open details to download seasons/episodes."
+                                ),
+                            );
+                            continue;
+                        }
+                        let job_id = self.state.next_download_id;
+                        self.state.next_download_id += 1;
+                        self.state.pending_downloads.push_back(
+                            crate::tui::state::QueuedDownloadJob::UnresolvedMovie {
+                                id: job_id,
+                                subject_id,
+                                title,
+                                provider,
+                            },
+                        );
+                        queued_count += 1;
+                    }
+                }
+                if queued_count > 0 {
+                    self.state.notify(
+                        NotificationKind::Info,
+                        "Batch Download Started",
+                        format!("{queued_count} movie(s) queued for download."),
+                    );
+                    self.action_sender.send(Action::ProcessPendingDownloads).ok();
+                }
+            }
+
+            Action::ToggleMarkCurrentItem => {
+                let target = self
+                    .state
+                    .search_list_state
+                    .selected()
+                    .and_then(|idx| self.state.search_results.get(idx))
+                    .map(|res| (res.id.clone(), res.title.clone()));
+                if let Some((id, title)) = target {
+                    self.state.toggle_mark_search_result(id.clone());
+                    let count = self.state.marked_count();
+                    if self.state.is_search_result_marked(&id) {
+                        self.state.notify(
+                            NotificationKind::Info,
+                            "Marked for Download",
+                            format!("\"{title}\" marked ({count} total)."),
+                        );
+                    } else {
+                        self.state.notify(
+                            NotificationKind::Info,
+                            "Unmarked",
+                            format!("\"{title}\" unmarked ({count} remaining)."),
+                        );
+                    }
+                }
+            }
+
+            Action::ClearMarkedItems => {
+                self.state.clear_marked_search_results();
+                self.state.notify(
+                    NotificationKind::Info,
+                    "Selection Cleared",
+                    "Cleared all marked items.",
+                );
+            }
+
+            Action::ProcessPendingDownloads => {
+                while self.state.active_downloads.len() < self.state.max_concurrent_downloads {
+                    let Some(job) = self.state.pending_downloads.pop_front() else {
+                        break;
+                    };
+                    self.action_sender
+                        .send(Action::StartDownloadJob(Box::new(job)))
+                        .ok();
+                }
+            }
+
+            Action::StartDownloadJob(boxed_job) => {
+                match *boxed_job {
+                    crate::tui::state::QueuedDownloadJob::Resolved {
+                        id,
+                        title,
+                        target_dir,
+                        base_name,
+                        destination,
+                        link,
+                        headers,
+                        subtitle_url,
+                        sub_lang,
+                        is_series,
+                        season,
+                        episode,
+                    } => {
+                        if self.state.active_downloads.len() < self.state.max_concurrent_downloads {
+                            self.spawn_download_worker(
+                                id,
+                                title,
+                                target_dir,
+                                base_name,
+                                destination,
+                                link,
+                                headers,
+                                subtitle_url,
+                                sub_lang,
+                                is_series,
+                                season,
+                                episode,
+                            );
+                        } else {
+                            self.state.pending_downloads.push_front(
+                                crate::tui::state::QueuedDownloadJob::Resolved {
+                                    id,
+                                    title,
+                                    target_dir,
+                                    base_name,
+                                    destination,
+                                    link,
+                                    headers,
+                                    subtitle_url,
+                                    sub_lang,
+                                    is_series,
+                                    season,
+                                    episode,
+                                },
+                            );
+                        }
+                    }
+                    crate::tui::state::QueuedDownloadJob::UnresolvedMovie {
+                        id,
+                        subject_id,
+                        title,
+                        provider,
+                    } => {
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.state
+                            .active_downloads
+                            .push(crate::tui::state::ActiveDownload {
+                                id,
+                                title: title.clone(),
+                                destination: std::path::PathBuf::new(),
+                                progress: 0.0,
+                                status: "Resolving stream...".into(),
+                                cancel: cancel.clone(),
+                                is_series: false,
+                                season: 0,
+                                episode: 0,
+                            });
+                        self.state.sync_legacy_download_state();
+
+                        let client = self.service.client.clone();
+                        let fourk = self.service.fourk_client.clone();
+                        let sender = self.action_sender.clone();
+                        let base_dir = self.resolve_download_base_dir();
+                        let title_clone = title.clone();
+                        let sub_id = subject_id.clone();
+                        let cancel_clone = cancel.clone();
+
+                        let handle = tokio::spawn(async move {
+                            if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            let streams_res = match provider {
+                                ProviderKind::FourKHdHub => {
+                                    if let Some(c) = fourk {
+                                        c.episode_streams(&sub_id, 0, 0).await.ok()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => {
+                                    crate::providers::ReleaseProvider::episode_streams(
+                                        &client, &sub_id, 0, 0,
+                                    )
+                                    .await
+                                    .ok()
+                                }
+                            };
+                            let streams = streams_res.unwrap_or_default();
+                            let best_release = streams.into_iter().find(|r| !r.mirrors.is_empty());
+                            let Some(release) = best_release else {
+                                sender
+                                    .send(Action::DownloadTaskFailed {
+                                        id,
+                                        error: format!("No streams found for \"{title_clone}\""),
+                                    })
+                                    .ok();
+                                return;
+                            };
+                            let Some(mirror) = release.mirrors.first().cloned() else {
+                                sender
+                                    .send(Action::DownloadTaskFailed {
+                                        id,
+                                        error: format!("No mirror found for \"{title_clone}\""),
+                                    })
+                                    .ok();
+                                return;
+                            };
+                            let clean_title =
+                                crate::providers::moviebox::clean_moviebox_title(&title_clone);
+                            let safe_title = crate::download::safe_file_stem(&clean_title);
+                            let target_dir = base_dir.join("Movies").join(&safe_title);
+                            let base_name = safe_title.clone();
+                            let extension = mirror
+                                .resolver_url
+                                .split('?')
+                                .next()
+                                .and_then(|path| path.rsplit('.').next())
+                                .filter(|ext| {
+                                    matches!(
+                                        ext.to_ascii_lowercase().as_str(),
+                                        "mp4" | "mkv" | "webm" | "ts"
+                                    )
+                                })
+                                .unwrap_or("mp4")
+                                .to_ascii_lowercase();
+                            let destination = target_dir.join(format!("{base_name}.{extension}"));
+
+                            if is_media_already_downloaded(&target_dir, &base_name) {
+                                sender
+                                    .send(Action::DownloadTaskCompleted {
+                                        id,
+                                        path: destination.to_string_lossy().into_owned(),
+                                    })
+                                    .ok();
+                                return;
+                            }
+
+                            sender
+                                .send(Action::StartDownloadJob(Box::new(
+                                    crate::tui::state::QueuedDownloadJob::Resolved {
+                                        id,
+                                        title: base_name.clone(),
+                                        target_dir,
+                                        base_name,
+                                        destination,
+                                        link: mirror.resolver_url,
+                                        headers: mirror.headers,
+                                        subtitle_url: None,
+                                        sub_lang: None,
+                                        is_series: false,
+                                        season: 0,
+                                        episode: 0,
+                                    },
+                                )))
+                                .ok();
+                        });
+                        self.request_tasks.download_tasks.insert(id, handle);
+                    }
+                }
+            }
+
+            Action::UpdateDownloadProgress {
+                id,
+                progress,
+                status,
+            } => {
+                if let Some(active) = self.state.active_downloads.iter_mut().find(|d| d.id == id) {
+                    if let Some(p) = progress {
+                        active.progress = p;
+                    }
+                    if let Some(s) = status {
+                        active.status = s;
+                    }
+                    self.state.sync_legacy_download_state();
+                    self.state.dirty = true;
+                }
+            }
+
+            Action::DownloadTaskCompleted { id, path } => {
+                let completed_title = if let Some(pos) =
+                    self.state.active_downloads.iter().position(|d| d.id == id)
+                {
+                    let item = self.state.active_downloads.remove(pos);
+                    self.request_tasks.download_tasks.remove(&id);
+                    Some(item.title)
+                } else {
+                    None
+                };
+                self.state.sync_legacy_download_state();
+                let title_str = completed_title.unwrap_or_else(|| "Download".to_string());
+                self.state.notify(
+                    NotificationKind::Success,
+                    "Download complete",
+                    format!("{title_str} saved to {path}"),
+                );
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
+                if !self.state.download_queue.is_empty() {
+                    self.action_sender.send(Action::ProcessDownloadQueue).ok();
+                }
+            }
+
+            Action::DownloadTaskFailed { id, error } => {
+                let failed_title = if let Some(pos) =
+                    self.state.active_downloads.iter().position(|d| d.id == id)
+                {
+                    let item = self.state.active_downloads.remove(pos);
+                    self.request_tasks.download_tasks.remove(&id);
+                    Some(item.title)
+                } else {
+                    None
+                };
+                self.state.sync_legacy_download_state();
+                let title_str = failed_title.unwrap_or_else(|| "Download".to_string());
+                self.state.notify(
+                    NotificationKind::Error,
+                    "Download failed",
+                    format!("{title_str}: {error}"),
+                );
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
+            }
+
+            Action::DownloadTaskPaused { id, path } => {
+                let paused_title = if let Some(pos) =
+                    self.state.active_downloads.iter().position(|d| d.id == id)
+                {
+                    let item = self.state.active_downloads.remove(pos);
+                    self.request_tasks.download_tasks.remove(&id);
+                    Some(item.title)
+                } else {
+                    None
+                };
+                self.state.sync_legacy_download_state();
+                let title_str = paused_title.unwrap_or_else(|| "Download".to_string());
+                self.state.notify(
+                    NotificationKind::Warning,
+                    "Download paused",
+                    format!("{title_str}: resume with {path}.part"),
+                );
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
+            }
+
+            Action::CancelDownloadId(id) => {
+                if let Some(pos) = self.state.active_downloads.iter().position(|d| d.id == id) {
+                    self.state.active_downloads[pos]
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.state.active_downloads[pos].status = "Cancelling...".to_string();
+                    self.request_tasks.cancel_download_task(id);
+                }
+            }
+
             Action::UpdateDownload(prog, stat) => {
                 if self.state.download_progress != prog || self.state.download_status != stat {
                     self.state.download_progress = prog;
-                    self.state.download_status = stat;
+                    self.state.download_status = stat.clone();
+                    if let Some(first) = self.state.active_downloads.first_mut() {
+                        if let Some(p) = prog {
+                            first.progress = p;
+                        }
+                        if let Some(s) = &stat {
+                            first.status = s.clone();
+                        }
+                    }
                     self.state.dirty = true;
                 }
             }
             Action::DownloadCompleted(path) => {
                 self.state.download_progress = Some(100.0);
                 self.state.download_status = Some("Completed".into());
+                if !self.state.active_downloads.is_empty() {
+                    let first_id = self.state.active_downloads[0].id;
+                    self.state.active_downloads.remove(0);
+                    self.request_tasks.download_tasks.remove(&first_id);
+                }
+                self.state.sync_legacy_download_state();
                 self.state.notify(
                     NotificationKind::Success,
                     "Download complete",
@@ -755,11 +1291,15 @@ impl App {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     sender.send(Action::ClearDownload).ok();
                 });
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
             }
             Action::DownloadFailed(error) => {
-                self.state.download_progress = None;
-                self.state.download_status = None;
-                self.state.download_title = None;
+                if !self.state.active_downloads.is_empty() {
+                    let first_id = self.state.active_downloads[0].id;
+                    self.state.active_downloads.remove(0);
+                    self.request_tasks.download_tasks.remove(&first_id);
+                }
+                self.state.sync_legacy_download_state();
                 if self.state.download_queue_total > 0 {
                     let total = self.state.download_queue_total;
                     let remaining = self.state.download_queue.len();
@@ -778,11 +1318,15 @@ impl App {
                 }
                 self.state.download_queue.clear();
                 self.state.download_queue_total = 0;
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
             }
             Action::DownloadPaused(path) => {
-                self.state.download_progress = None;
-                self.state.download_status = None;
-                self.state.download_title = None;
+                if !self.state.active_downloads.is_empty() {
+                    let first_id = self.state.active_downloads[0].id;
+                    self.state.active_downloads.remove(0);
+                    self.request_tasks.download_tasks.remove(&first_id);
+                }
+                self.state.sync_legacy_download_state();
                 if self.state.download_queue_total > 0 {
                     let total = self.state.download_queue_total;
                     let remaining = self.state.download_queue.len();
@@ -801,6 +1345,7 @@ impl App {
                 }
                 self.state.download_queue.clear();
                 self.state.download_queue_total = 0;
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
             }
             Action::ClearDownload => {
                 self.state.download_progress = None;
@@ -816,16 +1361,22 @@ impl App {
                     );
                     self.state.download_queue_total = 0;
                 }
+                self.action_sender.send(Action::ProcessPendingDownloads).ok();
             }
             Action::CancelDownload => {
+                for d in &self.state.active_downloads {
+                    d.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 self.state
                     .cancel_download
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 self.state.download_status = Some("Cancelling...".to_string());
+                self.state.pending_downloads.clear();
+                self.request_tasks.cancel_download();
                 self.state.notify(
                     NotificationKind::Warning,
                     "Cancelling download",
-                    "Partial data will be preserved.",
+                    "Active downloads cancelled, queue cleared.",
                 );
             }
             _ => return None,
@@ -1230,4 +1781,188 @@ mod tests {
         assert_eq!(series_file, expected_series_file);
         assert_eq!(series_sub, expected_series_sub);
     }
+
+    #[tokio::test]
+    async fn test_batch_mark_search_result_toggle_and_clear() {
+        let mut app = App::new();
+        assert_eq!(app.state.marked_count(), 0);
+
+        app.state.toggle_mark_search_result("sub-123".to_string());
+        assert_eq!(app.state.marked_count(), 1);
+        assert!(app.state.is_search_result_marked("sub-123"));
+
+        app.state.toggle_mark_search_result("sub-456".to_string());
+        assert_eq!(app.state.marked_count(), 2);
+        assert!(app.state.is_search_result_marked("sub-456"));
+
+        // Toggle again to unmark
+        app.state.toggle_mark_search_result("sub-123".to_string());
+        assert_eq!(app.state.marked_count(), 1);
+        assert!(!app.state.is_search_result_marked("sub-123"));
+
+        // Clear all
+        app.state.clear_marked_search_results();
+        assert_eq!(app.state.marked_count(), 0);
+        assert!(!app.state.is_search_result_marked("sub-456"));
+    }
+
+    #[tokio::test]
+    async fn test_confirm_batch_download_enqueues_marked_movies() {
+        let mut app = App::new();
+        app.state.active_screen = Screen::Home;
+        app.state.search_results = vec![
+            crate::models::SearchResult {
+                id: "mov-1".to_string(),
+                title: "Movie One".to_string(),
+                stype: 1, // Movie
+                release_year: "2024".to_string(),
+                cover_url: None,
+                season: 0,
+                episode: 0,
+                provider: ProviderKind::MovieBox,
+            },
+            crate::models::SearchResult {
+                id: "mov-2".to_string(),
+                title: "Movie Two".to_string(),
+                stype: 1, // Movie
+                release_year: "2023".to_string(),
+                cover_url: None,
+                season: 0,
+                episode: 0,
+                provider: ProviderKind::MovieBox,
+            },
+            crate::models::SearchResult {
+                id: "ser-1".to_string(),
+                title: "Series One".to_string(),
+                stype: 2, // Series
+                release_year: "2022".to_string(),
+                cover_url: None,
+                season: 1,
+                episode: 1,
+                provider: ProviderKind::MovieBox,
+            },
+        ];
+
+        app.state.toggle_mark_search_result("mov-1".to_string());
+        app.state.toggle_mark_search_result("mov-2".to_string());
+        app.state.toggle_mark_search_result("ser-1".to_string());
+        assert_eq!(app.state.marked_count(), 3);
+
+        app.handle_download(Action::ConfirmBatchDownload).await;
+
+        // Marked set should be cleared
+        assert_eq!(app.state.marked_count(), 0);
+
+        // 2 movies should be queued in pending_downloads
+        assert_eq!(app.state.pending_downloads.len(), 2);
+        let titles: Vec<String> = app
+            .state
+            .pending_downloads
+            .iter()
+            .map(|j| j.title().to_string())
+            .collect();
+        assert!(titles.contains(&"Movie One".to_string()));
+        assert!(titles.contains(&"Movie Two".to_string()));
+
+        // Notification for skipping series should be posted
+        let notif_messages: Vec<String> = app
+            .state
+            .notifications
+            .iter()
+            .map(|n| n.message.clone())
+            .collect();
+        assert!(
+            notif_messages.iter().any(|m| m.contains("Series One is a series")),
+            "Expected notification skipping Series One, got {:?}",
+            notif_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_downloads_limit_and_queuing() {
+        let mut app = App::new();
+        app.state.active_screen = Screen::Details;
+        app.state.max_concurrent_downloads = 2;
+
+        app.state.selected_details = Some(crate::providers::models::MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "m1".to_string(),
+            },
+            title: "Test Movie 1".to_string(),
+            media_type: crate::providers::models::MediaType::Movie,
+            year: Some("2024".to_string()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![],
+            dubs: vec![],
+        });
+
+        // 1st download
+        app.start_resilient_download(
+            None,
+            Some("https://example.com/movie1.mp4".to_string()),
+            vec![],
+        );
+        assert_eq!(app.state.active_downloads.len(), 1);
+        assert_eq!(app.state.pending_downloads.len(), 0);
+
+        // 2nd download
+        if let Some(details) = &mut app.state.selected_details {
+            details.title = "Test Movie 2".to_string();
+        }
+        app.start_resilient_download(
+            None,
+            Some("https://example.com/movie2.mp4".to_string()),
+            vec![],
+        );
+        assert_eq!(app.state.active_downloads.len(), 2);
+        assert_eq!(app.state.pending_downloads.len(), 0);
+
+        // 3rd download (limit is 2, so should be queued in pending_downloads)
+        if let Some(details) = &mut app.state.selected_details {
+            details.title = "Test Movie 3".to_string();
+        }
+        app.start_resilient_download(
+            None,
+            Some("https://example.com/movie3.mp4".to_string()),
+            vec![],
+        );
+        assert_eq!(app.state.active_downloads.len(), 2);
+        assert_eq!(app.state.pending_downloads.len(), 1);
+        assert_eq!(app.state.pending_downloads[0].title(), "Test Movie 3");
+
+        // Complete 1st download
+        let first_id = app.state.active_downloads[0].id;
+        app.handle_download(Action::DownloadTaskCompleted {
+            id: first_id,
+            path: "/tmp/movie1.mp4".to_string(),
+        })
+        .await;
+
+        // Active downloads should have 1 remaining, and ProcessPendingDownloads is dispatched
+        assert_eq!(app.state.active_downloads.len(), 1);
+
+        // Drain dispatched actions and verify
+        let mut found_job = false;
+        while let Ok(action) = app.action_receiver.try_recv() {
+            if let Action::StartDownloadJob(job) = action {
+                assert_eq!(job.title(), "Test Movie 3");
+                found_job = true;
+                break;
+            } else {
+                app.handle_download(action).await;
+            }
+        }
+        assert!(found_job);
+    }
 }
+

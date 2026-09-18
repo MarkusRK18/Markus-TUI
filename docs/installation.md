@@ -65,12 +65,14 @@ cargo install moviebox-tui --locked
 Clone the repository and build the release binary:
 
 ```bash
-git clone https://github.com/mesamirh/MovieBox-Tui.git
-cd MovieBox-Tui
-cargo build --release --locked
+git clone git@github.com:MarkusRK18/Markus-TUI.git
+cd Markus-TUI
+cargo build --release
 ```
 
-The compiled binary will be located at `target/release/moviebox-tui`.
+The compiled binary will be located at `target/release/moviebox-tui`. You can copy it to `~/.local/bin/` or `/usr/local/bin/`.
+
+For in-depth, distribution-specific instructions across Linux, macOS, Windows, and Termux, see [**INSTALLATION.md**](../INSTALLATION.md).
 
 ---
 

@@ -59,7 +59,8 @@ pub fn build_help_columns(
         left.push(help_section_header("Streaming Actions", theme));
         left.push(help_row("Enter", "Play selected release", theme));
         left.push(help_row("Space / P", "Resume (deck / history)", theme));
-        left.push(help_row("d", "Download episode / season", theme));
+        left.push(help_row("m", "Mark item for batch download", theme));
+        left.push(help_row("d", "Download episode / season / batch", theme));
         left.push(help_row("Del", "Remove from history", theme));
         left.push(help_row("f", "Favorite / unfavorite title", theme));
         left.push(help_row(
@@ -202,7 +203,8 @@ mod tests {
         assert!(left_text.contains("Navigation"));
         assert!(left_text.contains("Streaming Actions"));
         assert!(left_text.contains("Play selected release"));
-        assert!(left_text.contains("Download episode / season"));
+        assert!(left_text.contains("Mark item for batch download"));
+        assert!(left_text.contains("Download episode / season / batch"));
         assert!(left_text.contains("Remove from history"));
 
         assert!(right_text.contains("Content Modes"));

@@ -91,6 +91,30 @@ pub enum Action {
     PromptDownloadSeason,
     ConfirmDownloadSeason,
     ProcessDownloadQueue,
+    UpdateDownloadProgress {
+        id: u64,
+        progress: Option<f64>,
+        status: Option<String>,
+    },
+    DownloadTaskCompleted {
+        id: u64,
+        path: String,
+    },
+    DownloadTaskFailed {
+        id: u64,
+        error: String,
+    },
+    DownloadTaskPaused {
+        id: u64,
+        path: String,
+    },
+    CancelDownloadId(u64),
+    PromptBatchDownload,
+    ConfirmBatchDownload,
+    ToggleMarkCurrentItem,
+    ClearMarkedItems,
+    ProcessPendingDownloads,
+    StartDownloadJob(Box<crate::tui::state::QueuedDownloadJob>),
     FetchDetails(String, bool),
     DetailsSuccess(
         crate::providers::models::RequestContext,

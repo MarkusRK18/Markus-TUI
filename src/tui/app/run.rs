@@ -484,7 +484,18 @@ impl App {
             | Action::DownloadFailed(..)
             | Action::DownloadPaused(..)
             | Action::ClearDownload
-            | Action::CancelDownload => {
+            | Action::CancelDownload
+            | Action::UpdateDownloadProgress { .. }
+            | Action::DownloadTaskCompleted { .. }
+            | Action::DownloadTaskFailed { .. }
+            | Action::DownloadTaskPaused { .. }
+            | Action::CancelDownloadId(..)
+            | Action::PromptBatchDownload
+            | Action::ConfirmBatchDownload
+            | Action::ToggleMarkCurrentItem
+            | Action::ClearMarkedItems
+            | Action::ProcessPendingDownloads
+            | Action::StartDownloadJob(..) => {
                 self.handle_download(action).await;
             }
         }
@@ -505,8 +516,11 @@ impl App {
         let mut main_area = frame.area();
         let mut download_area = None;
 
-        if self.state.download_progress.is_some() {
-            let [m, d] = Self::split_main_and_download(main_area);
+        if self.state.download_progress.is_some() || !self.state.active_downloads.is_empty() {
+            let [m, d] = Self::split_main_and_download_for_state(
+                main_area,
+                self.state.active_downloads.len(),
+            );
             main_area = m;
             download_area = Some(d);
         }
@@ -544,10 +558,24 @@ impl App {
     }
 
     pub fn split_main_and_download(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 2] {
+        Self::split_main_and_download_for_state(area, 1)
+    }
+
+    pub fn split_main_and_download_for_state(
+        area: ratatui::layout::Rect,
+        active_count: usize,
+    ) -> [ratatui::layout::Rect; 2] {
         use ratatui::layout::{Constraint, Direction, Layout};
+        let gauge_height = if active_count <= 1 {
+            3
+        } else if active_count == 2 {
+            4
+        } else {
+            5
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .constraints([Constraint::Min(0), Constraint::Length(gauge_height)])
             .split(area);
         [chunks[0], chunks[1]]
     }
@@ -632,9 +660,11 @@ impl App {
     }
 
     fn draw_download_gauge(&self, frame: &mut Frame, download_area: Option<Rect>) {
-        let Some(prog) = self.state.download_progress else {
+        let has_downloads =
+            self.state.download_progress.is_some() || !self.state.active_downloads.is_empty();
+        if !has_downloads {
             return;
-        };
+        }
         let Some(dl_area) = download_area else {
             return;
         };
@@ -650,6 +680,164 @@ impl App {
         let is_compact = dl_area.width < 60;
         let basic = self.state.basic_terminal;
         let modal_active = self.state.has_active_modal();
+
+        if self.state.active_downloads.len() > 1 {
+            let active_len = self.state.active_downloads.len();
+            let pending_len = self.state.pending_downloads.len();
+            let prefix_style = if modal_active {
+                self.theme.muted
+            } else {
+                self.theme.teal.add_modifier(Modifier::BOLD)
+            };
+            let left_title_str = if basic {
+                if pending_len > 0 {
+                    format!(" [DL] ({} active, {} queued) ", active_len, pending_len)
+                } else {
+                    format!(" [DL] ({} active) ", active_len)
+                }
+            } else if pending_len > 0 {
+                format!(
+                    " ⬇ Downloading ({} active, {} queued) ",
+                    active_len, pending_len
+                )
+            } else {
+                format!(" ⬇ Downloading ({} active) ", active_len)
+            };
+
+            let cancel_label = if is_compact {
+                "[x] All"
+            } else {
+                "[x] Cancel All"
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(left_title_str, prefix_style))
+                .title(
+                    Line::from(vec![Span::styled(
+                        format!(" {cancel_label} "),
+                        if modal_active {
+                            self.theme.muted
+                        } else {
+                            self.theme.error.add_modifier(Modifier::BOLD)
+                        },
+                    )])
+                    .alignment(Alignment::Right),
+                )
+                .border_style(if modal_active {
+                    self.theme.muted
+                } else {
+                    self.theme.lavender
+                })
+                .border_type(crate::tui::overlay::border_type(basic));
+
+            let inner_area = block.inner(dl_area);
+            crate::tui::clear_area(frame, dl_area, &self.theme);
+            frame.render_widget(block, dl_area);
+
+            let row_count = inner_area.height as usize;
+            for row_idx in 0..row_count {
+                let Some(download) = self.state.active_downloads.get(row_idx) else {
+                    break;
+                };
+                let row_rect = Rect {
+                    x: inner_area.x,
+                    y: inner_area.y + row_idx as u16,
+                    width: inner_area.width,
+                    height: 1,
+                };
+
+                let title_budget = if is_compact { 12 } else { 18 };
+                let truncated_title =
+                    crate::tui::text::truncate_width(&download.title, title_budget);
+                let pct_val = download.progress.clamp(0.0, 100.0);
+                let pct_badge = format!(" {:>5.1}% ", pct_val);
+
+                let fixed_w = title_budget + 8 + 4;
+                let available_for_bar_and_status =
+                    (row_rect.width as usize).saturating_sub(fixed_w);
+
+                let bar_width = if available_for_bar_and_status < 20 {
+                    8usize.min(available_for_bar_and_status)
+                } else {
+                    (available_for_bar_and_status / 3).clamp(10, 24)
+                };
+
+                let track_cells = bar_width.saturating_sub(2);
+                let ratio = (pct_val / 100.0).clamp(0.0, 1.0);
+                let filled_cells = ((track_cells as f64) * ratio).round() as usize;
+                let unfilled_cells = track_cells.saturating_sub(filled_cells);
+
+                let mut spans = Vec::new();
+                spans.push(Span::styled(
+                    format!("{:<w$} ", truncated_title, w = title_budget),
+                    if modal_active {
+                        self.theme.muted
+                    } else {
+                        self.theme.title.add_modifier(Modifier::BOLD)
+                    },
+                ));
+                spans.push(Span::styled(
+                    pct_badge,
+                    if modal_active {
+                        self.theme.muted
+                    } else {
+                        self.theme.sapphire.add_modifier(Modifier::BOLD)
+                    },
+                ));
+                spans.push(Span::styled("[", self.theme.surface1));
+                if basic {
+                    spans.push(Span::styled(
+                        "=".repeat(filled_cells),
+                        if modal_active {
+                            self.theme.muted
+                        } else {
+                            self.theme.accent
+                        },
+                    ));
+                    spans.push(Span::styled("-".repeat(unfilled_cells), self.theme.surface1));
+                } else {
+                    spans.push(Span::styled(
+                        "━".repeat(filled_cells),
+                        if modal_active {
+                            self.theme.muted
+                        } else {
+                            self.theme.teal.add_modifier(Modifier::BOLD)
+                        },
+                    ));
+                    spans.push(Span::styled("─".repeat(unfilled_cells), self.theme.surface1));
+                }
+                spans.push(Span::styled("] ", self.theme.surface1));
+
+                let status_budget = available_for_bar_and_status.saturating_sub(bar_width + 3);
+                if status_budget >= 6 {
+                    let truncated_status =
+                        crate::tui::text::truncate_width(&download.status, status_budget);
+                    spans.push(Span::styled(
+                        truncated_status,
+                        if modal_active {
+                            self.theme.muted
+                        } else {
+                            self.theme.subtext1
+                        },
+                    ));
+                }
+
+                if row_idx + 1 == row_count && active_len > row_count {
+                    let overflow = active_len - row_count;
+                    spans.push(Span::styled(
+                        format!(" (+{} more)", overflow),
+                        self.theme.rating,
+                    ));
+                }
+
+                frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+            }
+            return;
+        }
+
+        let Some(prog) = self.state.download_progress else {
+            return;
+        };
         let raw_title = self
             .state
             .download_title

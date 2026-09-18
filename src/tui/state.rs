@@ -38,6 +38,59 @@ pub enum InputMode {
     Normal,
     Editing,
 }
+#[derive(Debug, Clone)]
+pub struct ActiveDownload {
+    pub id: u64,
+    pub title: String,
+    pub destination: std::path::PathBuf,
+    pub progress: f64,
+    pub status: String,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub is_series: bool,
+    pub season: usize,
+    pub episode: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum QueuedDownloadJob {
+    Resolved {
+        id: u64,
+        title: String,
+        target_dir: std::path::PathBuf,
+        base_name: String,
+        destination: std::path::PathBuf,
+        link: String,
+        headers: Vec<(String, String)>,
+        subtitle_url: Option<String>,
+        sub_lang: Option<String>,
+        is_series: bool,
+        season: usize,
+        episode: usize,
+    },
+    UnresolvedMovie {
+        id: u64,
+        subject_id: String,
+        title: String,
+        provider: crate::providers::models::ProviderKind,
+    },
+}
+
+impl QueuedDownloadJob {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Resolved { id, .. } => *id,
+            Self::UnresolvedMovie { id, .. } => *id,
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Resolved { title, .. } => title,
+            Self::UnresolvedMovie { title, .. } => title,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsCategory {
     #[default]
@@ -83,7 +136,7 @@ impl SettingsCategory {
 
     pub fn row_count(self) -> usize {
         match self {
-            Self::General => 3,
+            Self::General => 4,
             Self::ContentModes => 3,
             Self::Appearance => 1,
             Self::StorageInfo => 5,
@@ -187,6 +240,9 @@ pub struct AppState {
     pub season_download_confirm_yes_selected: bool,
     pub show_episode_download_confirm: bool,
     pub episode_download_confirm_yes_selected: bool,
+    pub show_batch_download_confirm: bool,
+    pub batch_download_confirm_yes_selected: bool,
+    pub marked_search_results: std::collections::HashSet<String>,
     pub is_waiting_for_download_stream: bool,
     pub auto_play_on_ready: bool,
     pub is_fetching_streams: bool,
@@ -282,6 +338,11 @@ pub struct AppState {
     pub download_queue: std::collections::VecDeque<(usize, usize)>,
     pub download_queue_total: usize,
 
+    pub active_downloads: Vec<ActiveDownload>,
+    pub pending_downloads: std::collections::VecDeque<QueuedDownloadJob>,
+    pub next_download_id: u64,
+    pub max_concurrent_downloads: usize,
+
     pub language_chosen: bool,
 
     pub subtitle_popup: bool,
@@ -362,6 +423,9 @@ impl Default for AppState {
             season_download_confirm_yes_selected: false,
             show_episode_download_confirm: false,
             episode_download_confirm_yes_selected: false,
+            show_batch_download_confirm: false,
+            batch_download_confirm_yes_selected: false,
+            marked_search_results: std::collections::HashSet::new(),
             is_waiting_for_download_stream: false,
             is_fetching_streams: false,
             auto_play_on_ready: false,
@@ -453,6 +517,10 @@ impl Default for AppState {
             download_dir: None,
             download_queue: std::collections::VecDeque::new(),
             download_queue_total: 0,
+            active_downloads: Vec::new(),
+            pending_downloads: std::collections::VecDeque::new(),
+            next_download_id: 1,
+            max_concurrent_downloads: 3,
             language_chosen: false,
 
             subtitle_popup: false,
@@ -825,6 +893,7 @@ impl AppState {
             || self.is_download_subtitle_popup
             || self.show_season_download_confirm
             || self.show_episode_download_confirm
+            || self.show_batch_download_confirm
             || self.show_overview_modal
             || (self.update_available.is_some() && self.input_mode != InputMode::Editing)
             || self.is_updating
@@ -1076,6 +1145,57 @@ impl AppState {
 
     pub fn can_disable_tv_mode(&self) -> bool {
         self.streaming_enabled
+    }
+
+    pub fn toggle_mark_search_result(&mut self, subject_id: String) {
+        if self.marked_search_results.contains(&subject_id) {
+            self.marked_search_results.remove(&subject_id);
+        } else {
+            self.marked_search_results.insert(subject_id);
+        }
+        self.dirty = true;
+    }
+
+    pub fn is_search_result_marked(&self, subject_id: &str) -> bool {
+        self.marked_search_results.contains(subject_id)
+    }
+
+    pub fn clear_marked_search_results(&mut self) {
+        self.marked_search_results.clear();
+        self.dirty = true;
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.marked_search_results.len()
+    }
+
+    pub fn cycle_settings_concurrent_downloads(&mut self, forward: bool) {
+        if forward {
+            self.max_concurrent_downloads = if self.max_concurrent_downloads >= 5 {
+                1
+            } else {
+                self.max_concurrent_downloads + 1
+            };
+        } else {
+            self.max_concurrent_downloads = if self.max_concurrent_downloads <= 1 {
+                5
+            } else {
+                self.max_concurrent_downloads - 1
+            };
+        }
+        self.dirty = true;
+    }
+
+    pub fn sync_legacy_download_state(&mut self) {
+        if let Some(first) = self.active_downloads.first() {
+            self.download_progress = Some(first.progress);
+            self.download_title = Some(first.title.clone());
+            self.download_status = Some(first.status.clone());
+        } else if self.pending_downloads.is_empty() {
+            self.download_progress = None;
+            self.download_title = None;
+            self.download_status = None;
+        }
     }
     pub fn expand_download_path(raw: &str) -> Option<std::path::PathBuf> {
         let clean = raw.trim_matches(|c| c == '\'' || c == '"').trim();

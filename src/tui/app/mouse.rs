@@ -43,13 +43,16 @@ impl App {
             }
         }
 
-        if self.state.download_progress.is_some() {
-            let [_, dl_area] = crate::tui::app::App::split_main_and_download(area);
+        if self.state.download_progress.is_some() || !self.state.active_downloads.is_empty() {
+            let [_, dl_area] = crate::tui::app::App::split_main_and_download_for_state(
+                area,
+                self.state.active_downloads.len(),
+            );
             if dl_area.contains(ratatui::layout::Position::new(col, row)) {
                 let cancel_rect = Rect {
-                    x: dl_area.right().saturating_sub(14),
+                    x: dl_area.right().saturating_sub(18),
                     y: dl_area.y,
-                    width: 14.min(dl_area.width),
+                    width: 18.min(dl_area.width),
                     height: 1,
                 };
                 if cancel_rect.contains(ratatui::layout::Position::new(col, row)) {
@@ -412,6 +415,38 @@ impl App {
                 }
             } else {
                 self.state.show_episode_download_confirm = false;
+            }
+            return true;
+        }
+
+        if self.state.show_batch_download_confirm {
+            let count = self.state.marked_count();
+            let summary = vec![
+                format!("Download {count} marked item(s) simultaneously?"),
+                format!(
+                    "Concurrent limit: {} (manage in Settings)",
+                    self.state.max_concurrent_downloads
+                ),
+            ];
+            let longest = summary
+                .iter()
+                .map(|line| crate::tui::text::width(line))
+                .max()
+                .unwrap_or(36);
+            let popup = crate::tui::overlay::download_confirm_layout(area, summary.len(), longest);
+            if popup.contains(ratatui::layout::Position::new(col, row)) {
+                let action_y =
+                    crate::tui::overlay::download_confirm_action_row(popup, summary.len());
+                if row == action_y {
+                    let mid_x = popup.x + popup.width / 2;
+                    if col < mid_x {
+                        self.action_sender.send(Action::ConfirmBatchDownload).ok();
+                    } else {
+                        self.state.show_batch_download_confirm = false;
+                    }
+                }
+            } else {
+                self.state.show_batch_download_confirm = false;
             }
             return true;
         }

@@ -381,6 +381,10 @@ impl App {
                     self.state.provider_list_state.select(None);
                     return None;
                 }
+                if self.state.show_batch_download_confirm {
+                    self.state.show_batch_download_confirm = false;
+                    return None;
+                }
                 if !self.state.notifications.is_empty() {
                     self.state.notifications.clear();
                     return None;

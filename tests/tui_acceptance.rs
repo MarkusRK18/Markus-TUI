@@ -1127,3 +1127,165 @@ async fn test_landing_deck_header_renders_without_star_or_bracket() {
     assert!(!text.contains("★"));
     assert!(!text.contains("- *  Favorites"));
 }
+
+#[tokio::test]
+async fn test_batch_marking_prompt_and_confirm_workflow() {
+    let mut app = App::new();
+    app.state_mut().active_screen = Screen::Home;
+    app.state_mut().input_mode = InputMode::Normal;
+    app.state_mut().search_results = vec![
+        SearchResult {
+            id: "movie_1".to_string(),
+            title: "Movie One".to_string(),
+            stype: 1,
+            release_year: "2021".to_string(),
+            cover_url: None,
+            season: 0,
+            episode: 0,
+            provider: ProviderKind::MovieBox,
+        },
+        SearchResult {
+            id: "movie_2".to_string(),
+            title: "Movie Two".to_string(),
+            stype: 1,
+            release_year: "2022".to_string(),
+            cover_url: None,
+            season: 0,
+            episode: 0,
+            provider: ProviderKind::MovieBox,
+        },
+    ];
+    app.state_mut().search_list_state.select(Some(0));
+
+    // Press 'm' on movie 1
+    let m_key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty());
+    app.handle_action(Action::Key(m_key)).await;
+    app.drain_actions().await;
+    assert_eq!(app.state().marked_count(), 1);
+    assert!(app.state().is_search_result_marked("movie_1"));
+
+    // Move down and press 'm' on movie 2
+    let down_key = KeyEvent::new(KeyCode::Down, KeyModifiers::empty());
+    app.handle_action(Action::Key(down_key)).await;
+    app.drain_actions().await;
+    app.handle_action(Action::Key(m_key)).await;
+    app.drain_actions().await;
+    assert_eq!(app.state().marked_count(), 2);
+    assert!(app.state().is_search_result_marked("movie_2"));
+
+    // Verify UI rendering contains checkmarks
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("[✓] Movie One"));
+    assert!(text.contains("[✓] Movie Two"));
+
+    // Press 'd' to open batch download prompt
+    let d_key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty());
+    app.handle_action(Action::Key(d_key)).await;
+    app.drain_actions().await;
+    assert!(app.state().show_batch_download_confirm);
+    assert!(app.state().has_active_modal());
+
+    // Confirm dialog by pressing 'y'
+    let y_key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty());
+    app.handle_action(Action::Key(y_key)).await;
+    app.drain_actions().await;
+
+    // Modal dismissed, marked cleared, and downloads queued/started
+    assert!(!app.state().show_batch_download_confirm);
+    assert_eq!(app.state().marked_count(), 0);
+    let total_active_and_pending = app.state().active_downloads.len() + app.state().pending_downloads.len();
+    assert_eq!(total_active_and_pending, 2);
+}
+
+#[tokio::test]
+async fn test_c_key_clears_marked_items_before_search() {
+    let mut app = App::new();
+    app.state_mut().active_screen = Screen::Home;
+    app.state_mut().input_mode = InputMode::Normal;
+    app.state_mut().search_query.set_content("Marvel");
+    app.state_mut().search_results = vec![
+        SearchResult {
+            id: "m1".to_string(),
+            title: "Iron Man".to_string(),
+            stype: 1,
+            release_year: "2008".to_string(),
+            cover_url: None,
+            season: 0,
+            episode: 0,
+            provider: ProviderKind::MovieBox,
+        },
+    ];
+    app.state_mut().search_list_state.select(Some(0));
+
+    // Mark item
+    let m_key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty());
+    app.handle_action(Action::Key(m_key)).await;
+    assert_eq!(app.state().marked_count(), 1);
+
+    // Press 'c' -> should clear marked items first, keeping query intact
+    let c_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+    app.handle_action(Action::Key(c_key)).await;
+    assert_eq!(app.state().marked_count(), 0);
+    assert_eq!(app.state().search_query, "Marvel");
+
+    // Press 'c' again -> now it clears the search query
+    app.handle_action(Action::Key(c_key)).await;
+    assert_eq!(app.state().search_query, "");
+}
+
+#[tokio::test]
+async fn test_multi_download_gauge_rendering() {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+
+    app.state_mut().active_downloads = vec![
+        moviebox_tui::tui::state::ActiveDownload {
+            id: 1,
+            title: "Interstellar".to_string(),
+            destination: std::path::PathBuf::from("/tmp/Interstellar.mp4"),
+            progress: 0.45,
+            status: "45.0% · 5.2 MB/s".to_string(),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_series: false,
+            season: 0,
+            episode: 0,
+        },
+        moviebox_tui::tui::state::ActiveDownload {
+            id: 2,
+            title: "Oppenheimer".to_string(),
+            destination: std::path::PathBuf::from("/tmp/Oppenheimer.mp4"),
+            progress: 0.80,
+            status: "80.0% · 12.1 MB/s".to_string(),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_series: false,
+            season: 0,
+            episode: 0,
+        },
+    ];
+    app.state_mut().sync_legacy_download_state();
+
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+
+    assert!(text.contains("Interstellar"));
+    assert!(text.contains("Oppenheimer"));
+    assert!(text.contains("2 active"));
+    assert!(text.contains("Cancel All"));
+}
+

@@ -18,11 +18,14 @@
 - **Live TV and IPTV**: Import custom M3U playlist URLs to search channels, browse categories, and stream live television.
 - **Native Video Playback**: Plays directly in your favorite player (`mpv`, `IINA`, `VLC`, or Android video players) with smooth hardware acceleration.
 - **Automatic Subtitles**: Automatically searches and loads subtitles in your preferred language into your player.
-- **Fast Downloads**: Save single episodes or entire seasons to your computer with pause and resume support.
+- **Fast & Concurrent Downloads**: Download multiple movies or entire seasons in parallel (up to 5 concurrent downloads) with pause/resume and batch-marking (`m` to mark, `d` to download).
 - **Visual Posters**: Displays cover art and movie posters directly inside your terminal window.
 - **Library and History**: Bookmark your favorite titles and pick up watching right where you left off.
 - **Custom Themes**: Built in color themes and settings to match your personal terminal look and feel.
 - **Cross Platform**: Works identically on macOS, Linux, Windows, and Android.
+
+> [!TIP]
+> For detailed step-by-step setup guides across Linux, macOS, Windows, and Android, see [**INSTALLATION.md**](INSTALLATION.md).
 
 ## Prerequisites
 
@@ -38,6 +41,17 @@ Requires at least one media player for streaming:
 *Optional for MovieBox downloads:* `yt-dlp` and `ffmpeg` are required only for downloading DASH streams from the MovieBox provider. All other providers download directly with the built in engine.
 
 ## Installation
+
+See [**INSTALLATION.md**](INSTALLATION.md) for full distribution packages and setup instructions.
+
+### Quick Build from Source
+
+```bash
+git clone git@github.com:MarkusRK18/Markus-TUI.git
+cd Markus-TUI
+cargo build --release
+cp target/release/moviebox-tui ~/.local/bin/
+```
 
 ### macOS and Linux
 
@@ -74,18 +88,13 @@ termux-setup-storage
 ```
 
 <details>
-<summary><b>Cargo and Source Build</b></summary>
+<summary><b>Cargo Install</b></summary>
 
-From crates.io:
+From local repository:
 ```bash
-cargo install moviebox-tui --locked
-```
-
-From source:
-```bash
-git clone https://github.com/mesamirh/MovieBox-Tui.git
-cd MovieBox-Tui
-cargo build --release --locked
+git clone git@github.com:MarkusRK18/Markus-TUI.git
+cd Markus-TUI
+cargo install --path . --locked
 ```
 
 </details>

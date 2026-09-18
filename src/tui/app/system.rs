@@ -134,6 +134,7 @@ impl App {
                         self.state.is_download_subtitle_popup = false;
                         self.state.show_season_download_confirm = false;
                         self.state.show_episode_download_confirm = false;
+                        self.state.show_batch_download_confirm = false;
                     }
                 }
             }
@@ -327,6 +328,10 @@ impl App {
                             self.state.cycle_settings_player(forward);
                             self.persist_config();
                         }
+                        3 => {
+                            self.state.cycle_settings_concurrent_downloads(forward);
+                            self.persist_config();
+                        }
                         _ => {}
                     }
                 }
@@ -455,6 +460,10 @@ impl App {
                                 self.state.settings_download_dir_input =
                                     Some(crate::tui::text::TextInputBuffer::from_str(&current));
                             }
+                        }
+                        3 => {
+                            self.state.cycle_settings_concurrent_downloads(true);
+                            self.persist_config();
                         }
                         _ => {}
                     }

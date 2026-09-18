@@ -22,6 +22,7 @@ pub struct Config {
     pub addons_enabled: bool,
     pub default_player: Option<String>,
     pub download_dir: Option<String>,
+    pub max_concurrent_downloads: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -41,6 +42,7 @@ impl Default for Config {
             addons_enabled: false,
             default_player: None,
             download_dir: None,
+            max_concurrent_downloads: 3,
         }
     }
 }

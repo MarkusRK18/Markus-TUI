@@ -799,6 +799,37 @@ impl App {
                         }
                         return None;
                     }
+
+                    if self.state.show_batch_download_confirm {
+                        match key.code {
+                            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                                self.state.batch_download_confirm_yes_selected = true;
+                            }
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                                self.state.batch_download_confirm_yes_selected = false;
+                            }
+                            KeyCode::Tab | KeyCode::BackTab => {
+                                self.state.batch_download_confirm_yes_selected =
+                                    !self.state.batch_download_confirm_yes_selected;
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                self.action_sender.send(Action::ConfirmBatchDownload).ok();
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                self.state.show_batch_download_confirm = false;
+                            }
+                            KeyCode::Enter => {
+                                if self.state.batch_download_confirm_yes_selected {
+                                    self.action_sender.send(Action::ConfirmBatchDownload).ok();
+                                } else {
+                                    self.state.show_batch_download_confirm = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                        return None;
+                    }
+
                     match key.code {
                         KeyCode::Esc => {
                             self.action_sender.send(Action::GoBack).ok();
@@ -939,12 +970,69 @@ impl App {
                         KeyCode::Char('c') | KeyCode::Char('C')
                             if self.state.download_progress.is_none() =>
                         {
-                            let had_search = !self.state.search_query.trim().is_empty()
-                                || !self.state.search_results.is_empty();
-                            self.state.clear_search_state();
-                            self.state.input_mode = InputMode::Normal;
-                            if had_search {
-                                self.state.set_status_default("Search cleared.");
+                            if self.state.marked_count() > 0 {
+                                self.state.clear_marked_search_results();
+                                self.state.notify(
+                                    crate::tui::overlay::NotificationKind::Info,
+                                    "Selection Cleared",
+                                    "Cleared all marked items.",
+                                );
+                            } else {
+                                let had_search = !self.state.search_query.trim().is_empty()
+                                    || !self.state.search_results.is_empty();
+                                self.state.clear_search_state();
+                                self.state.input_mode = InputMode::Normal;
+                                if had_search {
+                                    self.state.set_status_default("Search cleared.");
+                                }
+                            }
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            if self.state.favorites_focus {
+                                if let Some(idx) = self.state.favorites_landing_state.selected() {
+                                    if let Some(item) = self.state.favorites_landing_items().get(idx)
+                                    {
+                                        let subject_id = item.subject_id.clone();
+                                        let title = item.title.clone();
+                                        self.state.toggle_mark_search_result(subject_id.clone());
+                                        let count = self.state.marked_count();
+                                        if self.state.is_search_result_marked(&subject_id) {
+                                            self.state.notify(
+                                                crate::tui::overlay::NotificationKind::Info,
+                                                "Marked for Download",
+                                                format!("\"{title}\" marked ({count} total)."),
+                                            );
+                                        } else {
+                                            self.state.notify(
+                                                crate::tui::overlay::NotificationKind::Info,
+                                                "Unmarked",
+                                                format!(
+                                                    "\"{title}\" unmarked ({count} remaining)."
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if let Some(idx) = self.state.search_list_state.selected() {
+                                if let Some(res) = self.state.search_results.get(idx) {
+                                    let id = res.id.clone();
+                                    let title = res.title.clone();
+                                    self.state.toggle_mark_search_result(id.clone());
+                                    let count = self.state.marked_count();
+                                    if self.state.is_search_result_marked(&id) {
+                                        self.state.notify(
+                                            crate::tui::overlay::NotificationKind::Info,
+                                            "Marked for Download",
+                                            format!("\"{title}\" marked ({count} total)."),
+                                        );
+                                    } else {
+                                        self.state.notify(
+                                            crate::tui::overlay::NotificationKind::Info,
+                                            "Unmarked",
+                                            format!("\"{title}\" unmarked ({count} remaining)."),
+                                        );
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('f') | KeyCode::Char('F')
@@ -1057,6 +1145,32 @@ impl App {
                                 }
                             } else {
                                 self.resume_history_playback();
+                            }
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            if self.state.marked_count() > 0 {
+                                self.action_sender.send(Action::PromptBatchDownload).ok();
+                            } else if let Some(idx) = self.state.search_list_state.selected() {
+                                if let Some(res) = self.state.search_results.get(idx) {
+                                    self.state.toggle_mark_search_result(res.id.clone());
+                                    self.action_sender.send(Action::PromptBatchDownload).ok();
+                                }
+                            } else if self.state.favorites_focus {
+                                if let Some(idx) = self.state.favorites_landing_state.selected() {
+                                    if let Some(item) =
+                                        self.state.favorites_landing_items().get(idx)
+                                    {
+                                        self.state
+                                            .toggle_mark_search_result(item.subject_id.clone());
+                                        self.action_sender.send(Action::PromptBatchDownload).ok();
+                                    }
+                                }
+                            } else {
+                                self.state.notify(
+                                    crate::tui::overlay::NotificationKind::Info,
+                                    "Batch Download",
+                                    "No items marked. Press 'm' to mark items for download.",
+                                );
                             }
                         }
                         KeyCode::Char(c)

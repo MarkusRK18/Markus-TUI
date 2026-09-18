@@ -25,6 +25,7 @@ pub struct RequestTaskHandles {
     pub suggest: Option<tokio::task::JoinHandle<()>>,
     pub homepage: Option<tokio::task::JoinHandle<()>>,
     pub download: Option<tokio::task::JoinHandle<()>>,
+    pub download_tasks: std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
     pub stream_pool_init: Option<tokio::task::JoinHandle<()>>,
     pub episode_prefetch: Option<tokio::task::JoinHandle<()>>,
 }
@@ -61,6 +62,15 @@ impl RequestTaskHandles {
     }
     pub fn cancel_download(&mut self) {
         if let Some(h) = self.download.take() {
+            h.abort();
+        }
+        for (_, h) in self.download_tasks.drain() {
+            h.abort();
+        }
+    }
+
+    pub fn cancel_download_task(&mut self, id: u64) {
+        if let Some(h) = self.download_tasks.remove(&id) {
             h.abort();
         }
     }
@@ -157,6 +167,7 @@ impl App {
         state.active_theme_kind = config.active_theme;
         state.default_player = config.default_player;
         state.download_dir = config.download_dir.map(std::path::PathBuf::from);
+        state.max_concurrent_downloads = config.max_concurrent_downloads.clamp(1, 10);
         state.installed_addons = crate::config::load_addons();
 
         let env_theme = std::env::var("MOVIEBOX_THEME")
@@ -214,6 +225,12 @@ impl App {
         &mut self.state
     }
 
+    pub async fn drain_actions(&mut self) {
+        while let Ok(action) = self.action_receiver.try_recv() {
+            self.handle_action(action).await;
+        }
+    }
+
     fn request_context(&self) -> RequestContext {
         RequestContext {
             provider: self.state.active_provider,
@@ -251,6 +268,7 @@ impl App {
                 .download_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
+            max_concurrent_downloads: self.state.max_concurrent_downloads,
         };
         crate::tui::config::save(&config);
     }

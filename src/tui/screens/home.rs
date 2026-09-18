@@ -641,6 +641,7 @@ pub(crate) fn render_landing_deck(frame: &mut Frame, area: Rect, state: &AppStat
         crate::tui::state::HomeDeckTab::Favorites => fav_items
             .iter()
             .map(|item| {
+                let is_marked = state.is_search_result_marked(&item.subject_id);
                 let type_tag = if item.stype == 2 { "Series" } else { "Movie" };
                 let right_tag = if item.release_year.is_empty() {
                     type_tag.to_string()
@@ -653,7 +654,12 @@ pub(crate) fn render_landing_deck(frame: &mut Frame, area: Rect, state: &AppStat
                 let tag_len = crate::tui::text::width(&right_tag);
                 let hl_sym_len = 0;
                 let margins_len = 4;
-                let fixed_overhead = margins_len + tag_len;
+                let mark_w = if is_marked {
+                    if state.basic_terminal { 4 } else { 2 }
+                } else {
+                    0
+                };
+                let fixed_overhead = margins_len + tag_len + mark_w;
 
                 let max_title_width =
                     (inner_area.width as usize).saturating_sub(fixed_overhead + 1);
@@ -661,15 +667,21 @@ pub(crate) fn render_landing_deck(frame: &mut Frame, area: Rect, state: &AppStat
                     crate::tui::text::truncate_width(&item.title, max_title_width);
                 let title_width = crate::tui::text::width(&truncated_title);
                 let pad_len = (inner_area.width as usize)
-                    .saturating_sub(margins_len + hl_sym_len + title_width + tag_len);
+                    .saturating_sub(margins_len + hl_sym_len + mark_w + title_width + tag_len);
 
-                let line = Line::from(vec![
-                    Span::raw(left_margin),
-                    Span::styled(truncated_title, theme.text),
-                    Span::raw(" ".repeat(pad_len)),
-                    Span::styled(right_tag, theme.text_dim),
-                    Span::raw(right_margin),
-                ]);
+                let mut spans = vec![Span::raw(left_margin)];
+                if is_marked {
+                    spans.push(Span::styled(
+                        if state.basic_terminal { "[✓] " } else { "✔ " },
+                        theme.success.add_modifier(Modifier::BOLD),
+                    ));
+                }
+                spans.push(Span::styled(truncated_title, theme.text));
+                spans.push(Span::raw(" ".repeat(pad_len)));
+                spans.push(Span::styled(right_tag, theme.text_dim));
+                spans.push(Span::raw(right_margin));
+
+                let line = Line::from(spans);
                 ListItem::new(line)
             })
             .collect(),
@@ -1089,24 +1101,34 @@ fn render_search_bar(
             let total_pages = (total.saturating_sub(1) / visible_items) + 1;
             let page = (selected_idx / visible_items) + 1;
 
-            if total_pages > 1 {
+            let base_str = if total_pages > 1 {
                 if area.width < 58 {
-                    Some(format!(
+                    format!(
                         "{}/{} • p{}/{}",
                         selected_num, total, page, total_pages
-                    ))
+                    )
                 } else {
-                    Some(format!(
+                    format!(
                         "Item {} of {} • Page {}/{}",
                         selected_num, total, page, total_pages
-                    ))
+                    )
                 }
             } else if total == 1 {
-                Some("1 result".to_string())
+                "1 result".to_string()
             } else if area.width < 45 {
-                Some(format!("{}/{}", selected_num, total))
+                format!("{}/{}", selected_num, total)
             } else {
-                Some(format!("Item {} of {}", selected_num, total))
+                format!("Item {} of {}", selected_num, total)
+            };
+            let marked_count = state.marked_count();
+            if marked_count > 0 {
+                if area.width >= 60 {
+                    Some(format!("{base_str} • [{} marked: 'd' dl]", marked_count))
+                } else {
+                    Some(format!("{base_str} • [{}✓]", marked_count))
+                }
+            } else {
+                Some(base_str)
             }
         } else if view == SearchViewState::NoResults {
             Some("0 results".to_string())
@@ -1640,7 +1662,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                         .sum::<usize>()
                 });
 
+                let is_marked = state.is_search_result_marked(&res.id);
+                let mark_width = if is_marked {
+                    if state.basic_terminal { 4 } else { 2 }
+                } else {
+                    0
+                };
                 let title_reserved = if is_favorited { 3 } else { 1 }
+                    + mark_width
                     + badge_width
                     + if badge_width > 0 { 1 } else { 0 };
                 let max_title_width = (text_area.width as usize)
@@ -1653,6 +1682,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                     row1_spans.push(ratatui::text::Span::styled(" ", title_style));
                 } else {
                     row1_spans.push(ratatui::text::Span::raw(" "));
+                }
+                if is_marked {
+                    row1_spans.push(ratatui::text::Span::styled(
+                        if state.basic_terminal { "[✓] " } else { "✔ " },
+                        if modal_active {
+                            theme.muted
+                        } else {
+                            theme.success.add_modifier(Modifier::BOLD)
+                        },
+                    ));
                 }
                 if is_favorited {
                     row1_spans.push(ratatui::text::Span::styled(
@@ -1676,6 +1715,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
                 if let Some(b_spans) = badge_spans {
                     let title_actual_w = 1
+                        + mark_width
                         + if is_favorited { 2 } else { 0 }
                         + crate::tui::text::width(&display_title)
                         + if is_active_selection { 1 } else { 0 };
@@ -2176,6 +2216,26 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 minimum_width: 36,
                 show_counter: true,
             },
+            theme,
+            state.basic_terminal,
+        );
+    }
+
+    if state.show_batch_download_confirm {
+        let count = state.marked_count();
+        let summary_lines = vec![
+            Line::from(format!("Download {count} marked item(s) simultaneously?")),
+            Line::from(format!(
+                "Concurrent limit: {} (manage in Settings)",
+                state.max_concurrent_downloads
+            )),
+        ];
+        crate::tui::overlay::confirmation(
+            frame,
+            area,
+            " Confirm Batch Download ",
+            &summary_lines,
+            state.batch_download_confirm_yes_selected,
             theme,
             state.basic_terminal,
         );
